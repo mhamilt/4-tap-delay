@@ -109,7 +109,7 @@ void coupleMethodsToExternal( t_class* c)
 {
     class_addmethod(c, (method)onBang, "bang", 0);
     class_addmethod(c, (method)onList, "list", A_GIMME, 0);
-    class_addmethod(c, (method)onFloat, "float", A_FLOAT, 0);
+    class_addmethod(c, (method)onFloat, "float", A_FLOAT, 0);    
     class_addmethod(c, (method)inletAssistant,"assist", A_CANT,0);
     class_addmethod(c, (method)onPrintMessage, "print", 0);
     class_addmethod(c, (method)onAnyMessage, "anything", A_GIMME, 0);    
