@@ -11,6 +11,18 @@
 #include "ext.h"
 #include "ext_obex.h"
 #include "z_dsp.h"
+
+double getInterpOut(double floatIndex, double* audioBuffer, unsigned int buffersize)
+{
+    unsigned int bufferIndex = (int)floatIndex;
+    unsigned int nextBufferIndex = bufferIndex+1;
+    
+    if(nextBufferIndex >= buffersize)
+        nextBufferIndex = 0;
+    
+    double alpha = floatIndex - floor(floatIndex);
+    return (audioBuffer[bufferIndex] * (1.0 - alpha)) + (alpha * audioBuffer[nextBufferIndex]);
+}
 //------------------------------------------------------------------------------
 
 /// void* to the complete new Max External class so that it can be used in the class methods
@@ -27,18 +39,33 @@ const unsigned int numReadHeads = 4;
 /// @field externalMspObject Header for the MSP object
 typedef struct _MSPExternalObject
 {
+    ///
     t_pxobject externalMspObject;
+    ///
     double* delayLine;
-    double delayTimeMs[numReadHeads];
-    double delayTimeMSamples[numReadHeads];
-    unsigned int readHead[numReadHeads];
+    ///
+    unsigned int delayTimeMs[numReadHeads];
+    ///
+    unsigned int currentDelayTimeSamples[numReadHeads];
+    ///
+    double readHead[numReadHeads];
+    ///
     unsigned int targetReadHead[numReadHeads];
+    ///
+    unsigned int targetDelayTimeSamples[numReadHeads];
+    ///
     double slewTime;
+    ///
     unsigned int writeHead;
+    ///
     double passThruGain;
+    ///
     double gain[numReadHeads];
+    ///
     double sampRate;
+    ///
     void *inlet[numReadHeads];
+    ///
     long inletNumber;
 } MSPExternalObject;
 
@@ -61,14 +88,20 @@ void* myExternalConstructor(t_symbol *s, long argc, t_atom *argv)
     memset(maxObjectPtr->delayLine, 0, sizeof(double) * numDelayLineSamples);
     //--------------------------------------------------------------------------
     maxObjectPtr->passThruGain = 1.0;
+    
+    maxObjectPtr->writeHead = 0;
+    
     for (int i = 0; i < numReadHeads; i++)
     {
         maxObjectPtr->readHead[i] = ((int)numDelayLineSamples / numReadHeads) * i;
         maxObjectPtr->gain[i] = 0.707;
         maxObjectPtr->inlet[i] = proxy_new((t_object *)maxObjectPtr, (i+1), &maxObjectPtr->inletNumber);
+        
+        maxObjectPtr->currentDelayTimeSamples[i] = (maxObjectPtr->writeHead) - maxObjectPtr->readHead[i] - 1;
+        if (maxObjectPtr->currentDelayTimeSamples[i] < 0)
+            maxObjectPtr->currentDelayTimeSamples[i] += numDelayLineSamples;
     }
-    
-    maxObjectPtr->writeHead = 0;
+        
     //--------------------------------------------------------------------------
     return maxObjectPtr;
 }
@@ -79,6 +112,8 @@ void myExternDestructor(MSPExternalObject* maxObjectPtr)
 {
     dsp_free((t_pxobject*)maxObjectPtr);
 }
+
+
 
 //------------------------------------------------------------------------------
 #pragma mark DSP Loop
@@ -97,6 +132,16 @@ void mspExternalProcessBlock(MSPExternalObject* maxObjectPtr, t_object* dsp64,
                              long sampleframes, long flags, void* userparam)
 
 {
+    double stepSize[4] = {1.0, 1.0, 1.0, 1.0};
+    
+    if (maxObjectPtr->targetDelayTimeSamples[0] != maxObjectPtr->currentDelayTimeSamples[0])
+    {
+        if (maxObjectPtr->targetDelayTimeSamples[0] < maxObjectPtr->currentDelayTimeSamples[0])
+            stepSize[0] = 5.0;
+        else
+            stepSize[0] = 0.2;
+    }
+
     for (int i = 0; i < sampleframes; i++)
     {
         double inputSample = ins[0][i];
@@ -105,23 +150,20 @@ void mspExternalProcessBlock(MSPExternalObject* maxObjectPtr, t_object* dsp64,
 
         for (int j = 0; j < numReadHeads; j++)
         {
-            outs[0][i] += maxObjectPtr->delayLine[maxObjectPtr->readHead[j]] * maxObjectPtr->gain[j];
+            outs[0][i] += getInterpOut(maxObjectPtr->readHead[j], maxObjectPtr->delayLine, numDelayLineSamples) * maxObjectPtr->gain[j];
             
-            // Measure the distance between read and write head to detrmine delay time.
-//            if readHead is more than or equal to write head, minus the buffer size from read head.
-            // if distance is more than / less than required distance, then increse / decrease step size
-            // gradually increase decrese step size over slew time.
-            // change to single sample stap once desired delay achieved 
-            
-            maxObjectPtr->readHead[j]++;
-            if(maxObjectPtr->readHead[j] == numDelayLineSamples)
-                maxObjectPtr->readHead[j] = 0;
+            maxObjectPtr->readHead[j] += stepSize[j];
+            if(maxObjectPtr->readHead[j] >= (float)numDelayLineSamples)
+                maxObjectPtr->readHead[j] -= (float)numDelayLineSamples;            
         }
+        maxObjectPtr->currentDelayTimeSamples[0] = (maxObjectPtr->writeHead) - maxObjectPtr->readHead[0] - 1;
+        if (maxObjectPtr->currentDelayTimeSamples[0] < 0)
+            maxObjectPtr->currentDelayTimeSamples[0] += numDelayLineSamples;
+        
         maxObjectPtr->delayLine[maxObjectPtr->writeHead] = inputSample;
         if(++maxObjectPtr->writeHead == numDelayLineSamples)
                     maxObjectPtr->writeHead = 0;
     }
-    
 }
 
 //------------------------------------------------------------------------------
@@ -162,12 +204,17 @@ void onInt(MSPExternalObject* maxObjectPtr, long intIn)
     if(inletNumber)
     {
         long absDelayMs = labs(intIn);
-        long delaySamples = (absDelayMs*numDelayLineSamples)/1000;
+        long delaySamples = (absDelayMs*numDelayLineSamples) / 1000;
         if (delaySamples >= numDelayLineSamples)
             delaySamples =numDelayLineSamples - 1;
-        maxObjectPtr->targetReadHead[inletNumber - 1] = (unsigned int)delaySamples;
+        maxObjectPtr->targetDelayTimeSamples[inletNumber - 1] = (unsigned int)delaySamples;                
     }
     
+}
+
+void onPrint(MSPExternalObject* maxObjectPtr)
+{
+    post("C: %ld T: %ld",maxObjectPtr->currentDelayTimeSamples[0], maxObjectPtr->targetDelayTimeSamples[0]);
 }
 //------------------------------------------------------------------------------
 /// Bundle all class_addmethod calls into one function.
@@ -177,6 +224,7 @@ void coupleMethodsToExternal( t_class* c)
     class_addmethod(c, (method)prepareToPlay, "dsp64", A_CANT, 0);
     class_addmethod(c, (method)onFloat, "float", A_FLOAT, 0);
     class_addmethod(c, (method)onInt, "int", A_FLOAT, 0);
+    class_addmethod(c, (method)onPrint, "print", 0);
 }
 
 //------------------------------------------------------------------------------
