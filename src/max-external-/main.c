@@ -5,7 +5,7 @@
  Create an Issue on the repository if anything is amiss or you have any suggestion
  - mhamilt Mar 2020
  
-  For the variable delay, we need to speed up ordown the rate of delay if it is greater or less than the amount of delay
+ For the variable delay, we need to speed up ordown the rate of delay if it is greater or less than the amount of delay
  delay steps should be floating numbers and we need to interpolate between samples.
  */
 #include "ext.h"
@@ -15,7 +15,7 @@
 double getInterpOut(double floatIndex, double* audioBuffer, unsigned int buffersize)
 {
     unsigned int bufferIndex = (int)floatIndex;
-    unsigned int nextBufferIndex = bufferIndex+1;
+    unsigned int nextBufferIndex = bufferIndex + 1;
     
     if(nextBufferIndex >= buffersize)
         nextBufferIndex = 0;
@@ -23,6 +23,7 @@ double getInterpOut(double floatIndex, double* audioBuffer, unsigned int buffers
     double alpha = floatIndex - floor(floatIndex);
     return (audioBuffer[bufferIndex] * (1.0 - alpha)) + (alpha * audioBuffer[nextBufferIndex]);
 }
+
 //------------------------------------------------------------------------------
 
 /// void* to the complete new Max External class so that it can be used in the class methods
@@ -30,9 +31,22 @@ double getInterpOut(double floatIndex, double* audioBuffer, unsigned int buffers
 /// @code t_class* c = class_new(...);
 /// myExternClass = c;
 static t_class* myExternClass;
-const unsigned int numDelayLineSamples = 44100;
+///
+const unsigned int numDelayLineSamples = 220000;
+///
 const unsigned int numReadHeads = 4;
+///
+uint8_t postTimer = 0;
+///
+const int rampSize = 22000;
+double ramp[rampSize];
+typedef enum _RampState {
+    RAMP_UP,
+    RAMP_DOWN,
+    NO_RAMP,
+} RampState;
 
+RampState rampType = NO_RAMP;
 //------------------------------------------------------------------------------
 /// @struct MSPExternalObject
 /// @abstract The MaxMSP object
@@ -44,15 +58,15 @@ typedef struct _MSPExternalObject
     ///
     double* delayLine;
     ///
-    unsigned int delayTimeMs[numReadHeads];
+    int delayTimeMs[numReadHeads];
     ///
-    unsigned int currentDelayTimeSamples[numReadHeads];
+    int currentDelayTimeSamples[numReadHeads];
     ///
     double readHead[numReadHeads];
     ///
     unsigned int targetReadHead[numReadHeads];
     ///
-    unsigned int targetDelayTimeSamples[numReadHeads];
+    int targetDelayTimeSamples[numReadHeads];
     ///
     double slewTime;
     ///
@@ -62,11 +76,26 @@ typedef struct _MSPExternalObject
     ///
     double gain[numReadHeads];
     ///
+    double feedback;
+    ///
     double sampRate;
     ///
     void *inlet[numReadHeads];
     ///
     long inletNumber;
+    ///
+    bool shouldChangeStepSize[numReadHeads];
+    ///
+    bool hasJustChangedTarget[numReadHeads];
+    ///
+    double deltaDelay[numReadHeads];
+    ///
+    int rampIndex[numReadHeads];
+    ///
+    double currentSamplesTravelled[numReadHeads];
+    ///
+    RampState rampState[numReadHeads];
+    
 } MSPExternalObject;
 
 //------------------------------------------------------------------------------
@@ -88,6 +117,7 @@ void* myExternalConstructor(t_symbol *s, long argc, t_atom *argv)
     memset(maxObjectPtr->delayLine, 0, sizeof(double) * numDelayLineSamples);
     //--------------------------------------------------------------------------
     maxObjectPtr->passThruGain = 1.0;
+    maxObjectPtr->feedback = 0.0;
     
     maxObjectPtr->writeHead = 0;
     
@@ -97,12 +127,19 @@ void* myExternalConstructor(t_symbol *s, long argc, t_atom *argv)
         maxObjectPtr->gain[i] = 0.707;
         maxObjectPtr->inlet[i] = proxy_new((t_object *)maxObjectPtr, (i+1), &maxObjectPtr->inletNumber);
         
-        maxObjectPtr->currentDelayTimeSamples[i] = (maxObjectPtr->writeHead) - maxObjectPtr->readHead[i] - 1;
-        if (maxObjectPtr->currentDelayTimeSamples[i] < 0)
-            maxObjectPtr->currentDelayTimeSamples[i] += numDelayLineSamples;
+        maxObjectPtr->currentDelayTimeSamples[i] = ((maxObjectPtr->writeHead <= maxObjectPtr->readHead[i]) ? numDelayLineSamples : 0) + maxObjectPtr->writeHead - maxObjectPtr->readHead[i];
+        maxObjectPtr->targetDelayTimeSamples[i] = maxObjectPtr->currentDelayTimeSamples[i];
+        maxObjectPtr->shouldChangeStepSize[i] = false;
+        maxObjectPtr->rampIndex[i] = 0;
+        maxObjectPtr->rampState[i] = NO_RAMP;
+        maxObjectPtr->hasJustChangedTarget[i] = false;
     }
-        
+    
     //--------------------------------------------------------------------------
+    
+    for (int i = 0; i < rampSize; i++)
+        ramp[i] = sin(2 * PI * (float)i / ((float)rampSize * 4));
+    
     return maxObjectPtr;
 }
 
@@ -112,9 +149,119 @@ void myExternDestructor(MSPExternalObject* maxObjectPtr)
 {
     dsp_free((t_pxobject*)maxObjectPtr);
 }
+//------------------------------------------------------------------------------
 
-
-
+/// <#Description#>
+/// @param maxObjectPtr <#maxObjectPtr description#>
+/// @param stepSize <#stepSize description#>
+/// @param readHeadIndex <#readHeadIndex description#>
+void setStepSize(MSPExternalObject* maxObjectPtr, double* stepSize, int j)
+{
+    maxObjectPtr->currentDelayTimeSamples[j] = ((maxObjectPtr->writeHead <= maxObjectPtr->readHead[j]) ? numDelayLineSamples : 0) + maxObjectPtr->writeHead - maxObjectPtr->readHead[j];
+    
+    if(maxObjectPtr->shouldChangeStepSize[j])
+    {
+        double deltaDelay = maxObjectPtr->targetDelayTimeSamples[j] - maxObjectPtr->currentDelayTimeSamples[j];
+        
+        double absDeltaDelay = fabs(deltaDelay);
+        
+        if(!j)
+        {
+            if(!postTimer)
+                post("ramp index:", maxObjectPtr->rampIndex[j]);
+            postTimer++;
+        }
+        
+        
+        if (deltaDelay < -1)
+        {
+            if (maxObjectPtr->hasJustChangedTarget[j])
+            {
+                maxObjectPtr->hasJustChangedTarget[j] = false;
+                maxObjectPtr->rampState[j] = RAMP_UP;
+                post("Ramping Up");
+                maxObjectPtr->rampIndex[j] = 0;
+                maxObjectPtr->currentSamplesTravelled[j] = 0;
+            }
+            if (absDeltaDelay < maxObjectPtr->currentSamplesTravelled[j])
+            {
+                if (maxObjectPtr->rampState[j] != RAMP_DOWN)
+                    post("Ramping Down");
+                maxObjectPtr->rampState[j] = RAMP_DOWN;
+            }
+            stepSize[j] = 1.0 + ramp[maxObjectPtr->rampIndex[j]] * 4.0;
+            
+            switch (maxObjectPtr->rampState[j])
+            {
+                case RAMP_UP:
+                    maxObjectPtr->currentSamplesTravelled[j] += ramp[maxObjectPtr->rampIndex[j]] * 4.0;
+                    maxObjectPtr->rampIndex[j]++;
+                    if(maxObjectPtr->rampIndex[j] == (rampSize-1))
+                        maxObjectPtr->rampState[j] = NO_RAMP;
+                    break;
+                case RAMP_DOWN:
+                    maxObjectPtr->currentSamplesTravelled[j] -= ramp[maxObjectPtr->rampIndex[j]] * 4.0;
+                    maxObjectPtr->rampIndex[j]--;
+                    if(maxObjectPtr->rampIndex[j] <= 0)
+                    {
+                        maxObjectPtr->rampIndex[j] = 0;
+                        maxObjectPtr->rampState[j] = NO_RAMP;
+                        maxObjectPtr->currentSamplesTravelled[j] = 0;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        else if (deltaDelay > 1)
+        {
+            if (maxObjectPtr->hasJustChangedTarget[j])
+            {
+                maxObjectPtr->hasJustChangedTarget[j] = false;
+                rampType = RAMP_UP;
+                post("Ramping Up");
+                maxObjectPtr->rampIndex[j] = 0;
+                maxObjectPtr->currentSamplesTravelled[j] = 0;
+            }
+            
+            double stepMod = 1.0 - ((ramp[maxObjectPtr->rampIndex[j]] * 0.99) + 0.01 );
+            stepSize[j] = 1.0 * stepMod;
+            
+            switch (rampType)
+            {
+                case RAMP_UP:
+                    maxObjectPtr->currentSamplesTravelled[j] += ramp[maxObjectPtr->rampIndex[j]] * 4.0;
+                    maxObjectPtr->rampIndex[j]++;
+                    if(maxObjectPtr->rampIndex[j] == (rampSize-1))
+                        rampType = NO_RAMP;
+                    break;
+                case RAMP_DOWN:
+                    maxObjectPtr->rampIndex[j]--;
+                    
+                    if(maxObjectPtr->rampIndex[j] <= 0)
+                    {
+                        maxObjectPtr->rampIndex[j] = 0;
+                        rampType = NO_RAMP;
+                        maxObjectPtr->currentSamplesTravelled[j] = 0;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        else
+        {
+            maxObjectPtr->shouldChangeStepSize[j] = false;
+            stepSize[j] = 1.0;
+            post("Target Reached");
+        }
+    }
+    else
+    {
+        stepSize[j] = 1.0;
+        maxObjectPtr->readHead[j] = floor(maxObjectPtr->readHead[j]);
+    }
+}
 //------------------------------------------------------------------------------
 #pragma mark DSP Loop
 /// Main DSP process block, do your DSP here
@@ -132,37 +279,32 @@ void mspExternalProcessBlock(MSPExternalObject* maxObjectPtr, t_object* dsp64,
                              long sampleframes, long flags, void* userparam)
 
 {
-    double stepSize[4] = {1.0, 1.0, 1.0, 1.0};
+    double stepSize[numReadHeads] = {1.0, 1.0, 1.0, 1.0};
     
-    if (maxObjectPtr->targetDelayTimeSamples[0] != maxObjectPtr->currentDelayTimeSamples[0])
-    {
-        if (maxObjectPtr->targetDelayTimeSamples[0] < maxObjectPtr->currentDelayTimeSamples[0])
-            stepSize[0] = 5.0;
-        else
-            stepSize[0] = 0.2;
-    }
-
     for (int i = 0; i < sampleframes; i++)
     {
         double inputSample = ins[0][i];
         
         outs[0][i] = inputSample * maxObjectPtr->passThruGain;
-
+        
         for (int j = 0; j < numReadHeads; j++)
         {
-            outs[0][i] += getInterpOut(maxObjectPtr->readHead[j], maxObjectPtr->delayLine, numDelayLineSamples) * maxObjectPtr->gain[j];
+            setStepSize(maxObjectPtr, stepSize, j);
+            
+            outs[0][i] += getInterpOut(maxObjectPtr->readHead[j],
+                                       maxObjectPtr->delayLine,
+                                       numDelayLineSamples) * maxObjectPtr->gain[j];
             
             maxObjectPtr->readHead[j] += stepSize[j];
             if(maxObjectPtr->readHead[j] >= (float)numDelayLineSamples)
-                maxObjectPtr->readHead[j] -= (float)numDelayLineSamples;            
+                maxObjectPtr->readHead[j] -= (float)numDelayLineSamples;
         }
-        maxObjectPtr->currentDelayTimeSamples[0] = (maxObjectPtr->writeHead) - maxObjectPtr->readHead[0] - 1;
-        if (maxObjectPtr->currentDelayTimeSamples[0] < 0)
-            maxObjectPtr->currentDelayTimeSamples[0] += numDelayLineSamples;
         
-        maxObjectPtr->delayLine[maxObjectPtr->writeHead] = inputSample;
+        maxObjectPtr->delayLine[maxObjectPtr->writeHead] *= maxObjectPtr->feedback;
+        maxObjectPtr->delayLine[maxObjectPtr->writeHead] += inputSample;
+        
         if(++maxObjectPtr->writeHead == numDelayLineSamples)
-                    maxObjectPtr->writeHead = 0;
+            maxObjectPtr->writeHead = 0;
     }
 }
 
@@ -203,18 +345,21 @@ void onInt(MSPExternalObject* maxObjectPtr, long intIn)
     
     if(inletNumber)
     {
+        long i = inletNumber - 1;
+        maxObjectPtr->shouldChangeStepSize[i] = true;
+        maxObjectPtr->hasJustChangedTarget[i] = true;
         long absDelayMs = labs(intIn);
-        long delaySamples = (absDelayMs*numDelayLineSamples) / 1000;
+        long delaySamples = (absDelayMs * sys_getsr()) / 1000;
         if (delaySamples >= numDelayLineSamples)
-            delaySamples =numDelayLineSamples - 1;
-        maxObjectPtr->targetDelayTimeSamples[inletNumber - 1] = (unsigned int)delaySamples;                
+            delaySamples = numDelayLineSamples - 1;
+        maxObjectPtr->targetDelayTimeSamples[i] = (unsigned int)delaySamples;
     }
     
 }
 
 void onPrint(MSPExternalObject* maxObjectPtr)
 {
-    post("C: %ld T: %ld",maxObjectPtr->currentDelayTimeSamples[0], maxObjectPtr->targetDelayTimeSamples[0]);
+    post("C: %ud T: %ud", maxObjectPtr->currentDelayTimeSamples[0], maxObjectPtr->targetDelayTimeSamples[0]);
 }
 //------------------------------------------------------------------------------
 /// Bundle all class_addmethod calls into one function.
